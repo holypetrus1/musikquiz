@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#101014">
+  <title>Musikquiz Blind-Player</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color-scheme:dark}
+    *{box-sizing:border-box}body{margin:0;background:#101014;color:#fff;min-height:100vh;display:grid;place-items:center}
+    .app{width:min(94vw,540px);padding:22px}.card{background:#1b1b20;border:1px solid #34343b;border-radius:22px;padding:22px;box-shadow:0 12px 40px #0008}
+    h1{font-size:26px;margin:0 0 8px}.muted{color:#aaa;font-size:14px;line-height:1.45}.status{margin:18px 0;padding:18px;border-radius:16px;background:#27272e;text-align:center;font-weight:750;font-size:18px;min-height:58px;display:grid;place-items:center}
+    button,input{font:inherit}button{width:100%;padding:14px;border:0;border-radius:14px;font-weight:750;margin:6px 0;background:#fff;color:#111;cursor:pointer}button.secondary{background:#33343b;color:#fff}button.ghost{background:transparent;border:1px solid #484851;color:#ddd}
+    input{width:100%;padding:12px;border-radius:10px;border:1px solid #565660;background:#111116;color:#fff;margin:8px 0}#reader{overflow:hidden;border-radius:16px;margin-top:14px}.hidden{display:none}.solution{font-size:20px;line-height:1.45;text-align:center;padding:14px 0}.year{font-size:44px;font-weight:850}.tiny{font-size:12px;color:#8d8d95;line-height:1.45;margin-top:12px}.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#111116;padding:8px 10px;border-radius:9px;word-break:break-all;color:#ddd}.ok{color:#8be28b}.warn{color:#ffd56a}
+  </style>
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+<main class="app"><section class="card">
+  <h1>Musikquiz Blind-Player</h1>
+  <p class="muted">Scanne eine Karte hier in der App. Titel, Interpret und Jahr bleiben verborgen, während Spotify den Song startet.</p>
+
+  <div id="setup">
+    <p class="muted"><strong>Einmalige Einrichtung:</strong> Du brauchst Spotify Premium und eine kostenlose Spotify Developer App.</p>
+    <div class="tiny">Diese Redirect-URI in der Spotify-App eintragen:</div>
+    <div id="redirectUri" class="code"></div>
+    <button id="copyRedirect" class="ghost">Redirect-URI kopieren</button>
+    <label for="clientId">Spotify Client-ID</label>
+    <input id="clientId" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Client-ID deiner Spotify Developer App">
+    <button id="saveLogin">Mit Spotify verbinden</button>
+    <p class="tiny">Benötigte Spotify-Scopes: <code>user-read-playback-state</code> und <code>user-modify-playback-state</code>. Die Client-ID wird nur lokal auf diesem Gerät gespeichert.</p>
+  </div>
+
+  <div id="game" class="hidden">
+    <div id="status" class="status">Bereit zum Scannen</div>
+    <div id="reader"></div>
+    <button id="scanBtn">Kamera starten</button>
+    <button id="openSpotify" class="ghost">Spotify öffnen</button>
+    <button id="revealBtn" class="secondary hidden">Lösung anzeigen</button>
+    <div id="solution" class="solution hidden"></div>
+    <button id="nextBtn" class="hidden">Nächste Karte</button>
+    <button id="logout" class="secondary">Spotify-Verbindung zurücksetzen</button>
+  </div>
+</section></main>
+<script>
+const $=id=>document.getElementById(id);
+const redirect=location.origin+location.pathname;
+$('redirectUri').textContent=redirect;
+let token=null, refresh=null, expires=0, scanner=null, current=null;
+
+function b64url(bytes){return btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+async function sha256(s){return crypto.subtle.digest('SHA-256',new TextEncoder().encode(s))}
+function rand(n=64){const a=new Uint8Array(n);crypto.getRandomValues(a);return b64url(a)}
+
+async function login(){
+  const id=$('clientId').value.trim();
+  if(!id)return alert('Bitte zuerst die Spotify Client-ID eintragen.');
+  localStorage.setItem('mq_client',id);
+  const verifier=rand(64);sessionStorage.setItem('mq_verifier',verifier);
+  const challenge=b64url(await sha256(verifier));
+  const u=new URL('https://accounts.spotify.com/authorize');
+  u.search=new URLSearchParams({client_id:id,response_type:'code',redirect_uri:redirect,scope:'user-read-playback-state user-modify-playback-state',code_challenge_method:'S256',code_challenge:challenge}).toString();
+  location=u;
+}
+
+async function exchange(code){
+  const id=localStorage.getItem('mq_client'), verifier=sessionStorage.getItem('mq_verifier');
+  const r=await fetch('https://accounts.spotify.com/api/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:id,grant_type:'authorization_code',code,redirect_uri:redirect,code_verifier:verifier})});
+  const j=await r.json(); if(!r.ok)throw Error(j.error_description||'Spotify-Login fehlgeschlagen');
+  saveTokens(j);history.replaceState({},'',redirect);
+}
+function saveTokens(j){token=j.access_token;refresh=j.refresh_token||refresh;expires=Date.now()+j.expires_in*1000-30000;localStorage.setItem('mq_refresh',refresh||'');localStorage.setItem('mq_token',token);localStorage.setItem('mq_expires',expires)}
+async function ensureToken(){
+  token=localStorage.getItem('mq_token');refresh=localStorage.getItem('mq_refresh');expires=+localStorage.getItem('mq_expires')||0;
+  if(token&&Date.now()<expires)return token;if(!refresh)return null;
+  const id=localStorage.getItem('mq_client');
+  const r=await fetch('https://accounts.spotify.com/api/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({client_id:id,grant_type:'refresh_token',refresh_token:refresh})});
+  const j=await r.json();if(!r.ok)return null;saveTokens(j);return token;
+}
+async function api(path,opt={}){const t=await ensureToken();if(!t)throw Error('Nicht mit Spotify verbunden.');opt.headers={...(opt.headers||{}),Authorization:'Bearer '+t};return fetch('https://api.spotify.com/v1'+path,opt)}
+
+function parsePayload(txt){
+  if(!txt.startsWith('MQ1:'))throw Error('Das ist keine Musikquiz-Karte.');
+  let s=txt.slice(4).replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(s),c=>c.charCodeAt(0))));
+}
+function norm(s){return (s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9]/g,'')}
+
+async function playCard(data){
+  $('status').textContent='Song wird vorbereitet …';
+  const q=`track:"${data.t.replaceAll('"','')}" artist:"${data.a.replaceAll('"','')}"`;
+  let r=await api('/search?type=track&limit=5&market=DE&q='+encodeURIComponent(q));let j=await r.json();
+  if(!r.ok)throw Error(j.error?.message||'Spotify-Suche fehlgeschlagen');
+  let items=j.tracks?.items||[];
+  if(!items.length){r=await api('/search?type=track&limit=5&market=DE&q='+encodeURIComponent(data.a+' '+data.t));j=await r.json();items=j.tracks?.items||[]}
+  if(!items.length)throw Error('Song bei Spotify nicht gefunden.');
+  const wantedA=norm(data.a),wantedT=norm(data.t);
+  items.sort((x,y)=>{const sc=z=>(norm(z.name)==wantedT?5:0)+(z.artists.some(a=>wantedA.includes(norm(a.name))||norm(a.name).includes(wantedA))?3:0);return sc(y)-sc(x)});
+  const track=items[0];
+  const d=await api('/me/player/devices');const dj=await d.json();
+  const device=(dj.devices||[]).find(x=>x.is_active)||(dj.devices||[])[0];
+  if(!device)throw Error('Kein Spotify-Wiedergabegerät gefunden. Öffne Spotify kurz, starte oder pausiere dort einen Song und scanne dann erneut.');
+  const p=await api('/me/player/play?device_id='+encodeURIComponent(device.id),{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({uris:[track.uri]})});
+  if(!p.ok){let e='';try{e=(await p.json()).error?.message||''}catch{}throw Error(e||'Wiedergabe konnte nicht gestartet werden. Spotify Premium und ein aktives Wiedergabegerät sind erforderlich.');}
+  current=data;$('status').textContent='♪ Song läuft – jetzt raten!';$('revealBtn').classList.remove('hidden');$('solution').classList.add('hidden');$('nextBtn').classList.add('hidden');
+}
+
+async function onScan(txt){try{if(scanner)await scanner.stop();$('reader').innerHTML='';$('scanBtn').textContent='Kamera erneut starten';await playCard(parsePayload(txt))}catch(e){$('status').textContent=e.message;$('scanBtn').classList.remove('hidden')}}
+async function startScan(){try{if(scanner){try{await scanner.stop()}catch{}}scanner=new Html5Qrcode('reader');await scanner.start({facingMode:'environment'},{fps:12,qrbox:{width:250,height:250}},onScan,()=>{});$('status').textContent='QR-Code vor die Kamera halten'}catch(e){$('status').textContent='Kamera konnte nicht gestartet werden: '+e.message}}
+
+$('saveLogin').onclick=login;
+$('scanBtn').onclick=startScan;
+$('copyRedirect').onclick=async()=>{await navigator.clipboard.writeText(redirect);$('copyRedirect').textContent='Kopiert ✓';setTimeout(()=>$('copyRedirect').textContent='Redirect-URI kopieren',1500)};
+$('openSpotify').onclick=()=>location.href='spotify:';
+$('revealBtn').onclick=()=>{if(!current)return;$('solution').innerHTML=`<div class="year">${current.y}</div><strong>${current.t}</strong><br>${current.a}`;$('solution').classList.remove('hidden');$('revealBtn').classList.add('hidden');$('nextBtn').classList.remove('hidden')};
+$('nextBtn').onclick=()=>{current=null;$('solution').classList.add('hidden');$('nextBtn').classList.add('hidden');$('status').textContent='Bereit für die nächste Karte';startScan()};
+$('logout').onclick=()=>{['mq_token','mq_refresh','mq_expires'].forEach(k=>localStorage.removeItem(k));location.reload()};
+
+(async()=>{
+  const cid=localStorage.getItem('mq_client');if(cid)$('clientId').value=cid;
+  const params=new URLSearchParams(location.search);const code=params.get('code');const oauthError=params.get('error');
+  if(oauthError){alert('Spotify-Anmeldung abgebrochen: '+oauthError);history.replaceState({},'',redirect)}
+  try{if(code)await exchange(code);if(await ensureToken()){$('setup').classList.add('hidden');$('game').classList.remove('hidden')}}catch(e){alert(e.message)}
+})();
+</script>
+</body></html>
